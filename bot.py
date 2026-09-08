@@ -63,6 +63,43 @@ cur = conn.execute(
 )
 return cur.fetchall()
 
+def remove_user(chat_id: int, user_id: int):
+with closing(sqlite3.connect(DB_PATH)) as conn:
+conn.execute(
+“DELETE FROM users WHERE chat_id = ? AND user_id = ?”,
+(chat_id, user_id)
+)
+conn.commit()
+
+def save_username_only(chat_id: int, username: str):
+“”“Добавляет человека в базу по username, без user_id и без того, чтобы
+он что-либо писал в чат. Используется командой /addmention.
+Настоящий user_id неизвестен — упоминание будет идти просто через
+@username (см. make_mention), это работает всегда, в отличие от
+ссылок tg://user?id=, которым нужен реальный, «увиденный» ботом id.”””
+username = username.lstrip(”@”).lower()
+with closing(sqlite3.connect(DB_PATH)) as conn:
+# Проверяем — вдруг такой username уже есть в базе с реальным user_id
+# (человек уже писал в чат) — тогда трогать не нужно.
+cur = conn.execute(
+“SELECT user_id FROM users WHERE chat_id = ? AND LOWER(username) = ?”,
+(chat_id, username)
+)
+if cur.fetchone():
+return False  # уже есть
+    # Генерируем отрицательный "псевдо-id" на основе username, чтобы не
+    # конфликтовать с настоящими user_id (они всегда положительные) и
+    # чтобы можно было хранить несколько username-заглушек.
+    pseudo_id = -abs(hash(username)) % (10 ** 9)
+    conn.execute("""
+        INSERT INTO users (chat_id, user_id, username, full_name, thread_id)
+        VALUES (?, ?, ?, ?, 0)
+        ON CONFLICT(chat_id, user_id) DO UPDATE SET
+            username=excluded.username
+    """, (chat_id, pseudo_id, username, username))
+    conn.commit()
+    return True
+
 # ––––– ЛОГИКА УПОМИНАНИЙ –––––
 
 def make_mention(user_id: int, username: str | None, full_name: str) -> str:
@@ -83,7 +120,6 @@ try:
 await bot.delete_message(chat_id=chat_id, message_id=message_id)
 except Exception as e:
 logging.warning(f”Не удалось удалить сообщение {message_id}: {e}”)
-
 # ––––– ХЕНДЛЕРЫ –––––
 
 @dp.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
@@ -100,6 +136,51 @@ full_name=message.from_user.full_name,
 # Команда должна обрабатываться и здесь, если не хотите отдельный хендлер —
 # но ниже сделан отдельный хендлер с приоритетом через Command()
 await handle_mention_all(message)
+
+@dp.message(Command(“addmention”))
+async def handle_add_mention(message: Message):
+“”“Ручное добавление человека в список упоминаний по username, без того
+чтобы он сам писал в чат. Использование:
+/addmention @ivan_petrov @anna_k @sidorov
+Можно перечислить сразу несколько username через пробел.”””
+if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+return
+parts = message.text.split()[1:]  # всё, кроме самой команды
+usernames = [p for p in parts if p.startswith("@") and len(p) > 1]
+
+if not usernames:
+    await message.answer(
+        "Укажите username через пробел, например:\n"
+        "/addmention @ivan_petrov @anna_k"
+    )
+    return
+
+added, already_have = [], []
+for uname in usernames:
+    if save_username_only(message.chat.id, uname):
+        added.append(uname)
+    else:
+        already_have.append(uname)
+
+reply_lines = []
+if added:
+    reply_lines.append("Добавлены: " + ", ".join(added))
+if already_have:
+    reply_lines.append("Уже были в списке: " + ", ".join(already_have))
+await message.answer("\n".join(reply_lines))
+
+@dp.chat_member()
+async def on_member_left(update):
+“”“Когда участник покидает чат (сам вышел или был исключён), убираем
+его из базы, чтобы бот больше не пытался его упоминать.
+Для получения этих событий боту нужны права администратора в группе.”””
+new_status = update.new_chat_member.status
+if new_status in (“left”, “kicked”):
+remove_user(update.chat.id, update.new_chat_member.user.id)
+logging.info(
+f”Пользователь {update.new_chat_member.user.id} убран из базы “
+f”(вышел/исключён из чата {update.chat.id})”
+)
 
 @dp.message(Command(“all”, “everyone”, “упомянуть”))
 async def handle_mention_all(message: Message):
@@ -122,7 +203,7 @@ if not users:
 sent_message_ids = []
 
 for chunk in chunk_list(users, MENTIONS_PER_MESSAGE):
-mentions = [make_mention(uid, uname, fname) for uid, uname, fname in chunk]
+    mentions = [make_mention(uid, uname, fname) for uid, uname, fname in chunk]
     text = " ".join(mentions)
 
     try:
@@ -149,7 +230,10 @@ for msg_id in sent_message_ids:
 
 async def main():
 init_db()
-await dp.start_polling(bot)
+# allowed_updates перечисляем явно: по умолчанию aiogram не запрашивает
+# chat_member-события (вход/выход участников), их нужно включить отдельно.
+await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
 if name == “**main**”:
-asyncio.run(main())
+asyncio.
+run(main())
