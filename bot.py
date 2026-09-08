@@ -4,7 +4,7 @@ import os
 import sqlite3
 from contextlib import closing
 
-from aiogram import Bot, Dispatcher, F
+from aiogram import Bot, Dispatcher
 from aiogram.filters import Command
 from aiogram.types import Message
 from aiogram.enums import ChatType, ParseMode
@@ -128,24 +128,29 @@ async def delete_later(chat_id: int, message_id: int, delay: int):
         logging.warning(f"Не удалось удалить сообщение {message_id}: {e}")
 
 
+# ---------- MIDDLEWARE: ОТСЛЕЖИВАНИЕ ПОЛЬЗОВАТЕЛЕЙ ----------
+# Раньше это было сделано отдельным хендлером-"перехватчиком", который
+# ловил вообще любое сообщение и не давал командам (/all, /addmention)
+# доходить до своих настоящих обработчиков. Через middleware отслеживание
+# происходит "по пути" и не мешает дальнейшей обработке команд.
+
+class UserTrackerMiddleware:
+    async def __call__(self, handler, message: Message, data: dict):
+        if message.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
+            if message.from_user and not message.from_user.is_bot:
+                save_user(
+                    chat_id=message.chat.id,
+                    user_id=message.from_user.id,
+                    username=message.from_user.username,
+                    full_name=message.from_user.full_name,
+                )
+        return await handler(message, data)
+
+
+dp.message.middleware(UserTrackerMiddleware())
+
+
 # ---------- ХЕНДЛЕРЫ ----------
-
-@dp.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
-async def track_users(message: Message):
-    """Запоминаем каждого написавшего — иначе бот физически не может
-    узнать список участников чата (ограничение Telegram Bot API)."""
-    if message.from_user and not message.from_user.is_bot:
-        save_user(
-            chat_id=message.chat.id,
-            user_id=message.from_user.id,
-            username=message.from_user.username,
-            full_name=message.from_user.full_name,
-        )
-
-    # Команда должна обрабатываться и здесь, если не хотите отдельный хендлер —
-    # но ниже сделан отдельный хендлер с приоритетом через Command()
-    await handle_mention_all(message)
-
 
 @dp.message(Command("addmention"))
 async def handle_add_mention(message: Message):
@@ -197,9 +202,6 @@ async def on_member_left(update):
 
 @dp.message(Command("all", "everyone", "упомянуть"))
 async def handle_mention_all(message: Message):
-    if message.text is None or not message.text.startswith(("/all", "/everyone", "/упомянуть")):
-        return  # это вызов из track_users не по команде — просто выходим
-
     if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
         await message.answer("Эта команда работает только в группах.")
         return
