@@ -47,6 +47,7 @@ dp = Dispatcher()
 BOT_COMMANDS = [
     BotCommand(command="all", description="📣 Упомянуть всех известных участников"),
     BotCommand(command="add", description="➕ Добавить человека по @username"),
+    BotCommand(command="remove", description="🗑 Убрать человека по @username"),
     BotCommand(command="list", description="📋 Список известных + резервная копия"),
     BotCommand(command="help", description="❓ Список команд и как ими пользоваться"),
 ]
@@ -88,6 +89,16 @@ def _pseudo_id(username: str) -> int:
 
 def save_user(chat_id: int, user_id: int, username: str | None, full_name: str):
     with closing(sqlite3.connect(DB_PATH)) as conn:
+        # Если этот человек раньше был добавлен вручную через /add (у него
+        # была только username-заглушка с отрицательным псевдо-id) — удаляем
+        # ту старую запись, иначе получим дубль: и заглушку, и настоящую
+        # запись с реальным user_id, и человека упомянут дважды.
+        if username:
+            conn.execute("""
+                DELETE FROM users
+                WHERE chat_id = ? AND user_id < 0 AND LOWER(username) = ?
+            """, (chat_id, username.lower()))
+
         conn.execute("""
             INSERT INTO users (chat_id, user_id, username, full_name, thread_id)
             VALUES (?, ?, ?, ?, 0)
@@ -96,6 +107,27 @@ def save_user(chat_id: int, user_id: int, username: str | None, full_name: str):
                 full_name=excluded.full_name
         """, (chat_id, user_id, username, full_name))
         conn.commit()
+
+
+async def try_resolve_user(username: str):
+    """Пытается получить настоящий user_id и актуальные данные человека по
+    username через Telegram Bot API (метод get_chat) — работает для людей
+    с публичным username, даже если бот никогда не получал от них
+    сообщений напрямую. Это позволяет с самого начала завести "настоящую"
+    запись вместо username-заглушки, и такая запись потом сама подхватывает
+    смену username при обновлении (см. refresh в handle_mention_all).
+    Возвращает (user_id, username, full_name) или None, если не вышло
+    (например, у человека нет публичного username, или Telegram не дал
+    информацию о нём — бывает из-за настроек приватности)."""
+    try:
+        chat = await bot.get_chat(f"@{username}")
+        if chat.type != "private":
+            return None
+        full_name = " ".join(filter(None, [chat.first_name, chat.last_name])) or username
+        return chat.id, (chat.username or username), full_name
+    except Exception as e:
+        logging.info(f"Не удалось разрешить @{username} через get_chat: {e}")
+        return None
 
 
 def get_known_chat_ids() -> list[int]:
@@ -150,6 +182,30 @@ def remove_user(chat_id: int, user_id: int):
             (chat_id, user_id)
         )
         conn.commit()
+
+
+def get_existing_user_id_by_username(chat_id: int, username: str) -> int | None:
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        cur = conn.execute(
+            "SELECT user_id FROM users WHERE chat_id = ? AND LOWER(username) = ?",
+            (chat_id, username.lower())
+        )
+        row = cur.fetchone()
+        return row[0] if row else None
+
+
+def remove_by_username(chat_id: int, username: str) -> bool:
+    """Удаляет человека из базы по username (используется командой /remove,
+    например для чистки устаревшей записи после смены ника). Возвращает
+    True, если запись была найдена и удалена."""
+    username = username.lstrip("@").lower()
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        cur = conn.execute(
+            "DELETE FROM users WHERE chat_id = ? AND LOWER(username) = ?",
+            (chat_id, username)
+        )
+        conn.commit()
+        return cur.rowcount > 0
 
 
 def save_username_only(chat_id: int, username: str):
@@ -259,13 +315,25 @@ async def handle_help(message: Message):
         "обязательна), без того чтобы он сам писал в чат. Работает и в "
         "группе, и в личных сообщениях боту.\n"
         "🔒 Доступно только пользователям из белого списка.\n\n"
+        "🗑 <b>/remove</b> username1 username2 ...\n"
+        "Убрать человека из списка упоминаний. Нужно, если человек сменил "
+        "username ещё до того, как впервые написал в чат — старая запись "
+        "иначе так и останется привязана к прежнему нику.\n"
+        "🔒 Доступно только пользователям из белого списка.\n\n"
         "📋 <b>/list</b>\n"
         "Показать всех известных боту людей и получить готовую команду "
         "/add для резервной копии — на случай если база вдруг очистится. "
         "Тоже работает и в группе, и в личке.\n"
         "🔒 Доступно только пользователям из белого списка.\n\n"
         "❓ <b>/help</b>\n"
-        "Показать это сообщение. Доступно всем."
+        "Показать это сообщение. Доступно всем.\n\n"
+        "<i>Смена username теперь в большинстве случаев отслеживается "
+        "автоматически: при /add бот сразу пытается узнать настоящий id "
+        "человека, и если получилось — перед каждым /all обновляет его "
+        "текущий username сам. Ручной /remove + /add нужен, только если "
+        "Telegram не даёт узнать id человека напрямую (например, из-за "
+        "настроек приватности) — тогда используется username-заглушка, "
+        "которая при смене ника не обновляется сама.</i>"
     )
     await message.answer(text)
 
@@ -300,16 +368,73 @@ async def handle_add_mention(message: Message):
 
     added, already_have = [], []
     for uname in usernames:
-        if save_username_only(target_chat_id, uname):
-            added.append(uname)
+        uname_clean = uname.lstrip("@").lower()
+        existing_id = get_existing_user_id_by_username(target_chat_id, uname_clean)
+
+        resolved = await try_resolve_user(uname_clean)
+        if resolved:
+            # Получилось узнать настоящий user_id — заводим "настоящую"
+            # запись. Она будет сама обновляться при смене username (и при
+            # его сообщениях, и заранее при каждом /all, см. refresh ниже).
+            real_id, actual_username, full_name = resolved
+            save_user(target_chat_id, real_id, actual_username, full_name)
+            if existing_id == real_id:
+                already_have.append(actual_username)
+            else:
+                added.append(actual_username)
         else:
-            already_have.append(uname)
+            # Не вышло узнать id (нет публичного username, приватность и
+            # т.п.) — используем старый способ через username-заглушку.
+            if save_username_only(target_chat_id, uname_clean):
+                added.append(uname_clean)
+            else:
+                already_have.append(uname_clean)
 
     reply_lines = []
     if added:
         reply_lines.append("✅ Добавлены: " + ", ".join(f"@{u}" for u in added))
     if already_have:
         reply_lines.append("ℹ️ Уже были в списке: " + ", ".join(f"@{u}" for u in already_have))
+    await message.answer("\n".join(reply_lines))
+
+
+@dp.message(Command("remove"))
+async def handle_remove(message: Message):
+    """Убрать человека из списка упоминаний по username. Пригодится, если
+    человек сменил username ещё до того, как впервые написал в чат — его
+    старая запись в базе "зависает" на прежнем нике и упоминание перестаёт
+    работать. Использование:
+        /remove old_username
+    После этого можно /add с новым username."""
+    if not await require_access(message):
+        return
+
+    target_chat_id = await resolve_target_chat_id(message)
+    if target_chat_id is None:
+        return
+
+    parts = message.text.split()[1:]
+    usernames = [p.lstrip("@") for p in parts if p.lstrip("@")]
+
+    if not usernames:
+        await message.answer(
+            "Укажите username через пробел, например:\n"
+            "<code>/remove old_username</code>"
+        )
+        return
+
+    removed, not_found = [], []
+    for uname in usernames:
+        if remove_by_username(target_chat_id, uname):
+            removed.append(uname)
+        else:
+            not_found.append(uname)
+
+    reply_lines = []
+    if removed:
+        reply_lines.append("🗑 Удалены: " + ", ".join(f"@{u}" for u in removed))
+    if not_found:
+        reply_lines.append("ℹ️ Не найдены в списке: " + ", ".join(f"@{u}" for u in not_found))
     await message.answer("\n".join(reply_lines))
 
 
@@ -380,6 +505,28 @@ async def handle_mention_all(message: Message):
     if not users:
         await message.answer("🤷 Пока никого не знаю. Пусть люди сначала что-нибудь напишут в чате.")
         return
+
+    # Перед отправкой обновляем username у всех "настоящих" записей (у кого
+    # положительный user_id) — так бот упомянет актуальным ником, даже если
+    # человек сменил его сам, но не написал с тех пор ни одного сообщения.
+    # Псевдо-записи (отрицательный id, из /add без резолва) обновить так
+    # нельзя — для них нет способа узнать текущий username без сообщения.
+    refreshed = []
+    for uid, uname, fname in users:
+        if uid > 0:
+            try:
+                chat = await bot.get_chat(uid)
+                new_username = chat.username
+                new_full_name = " ".join(filter(None, [chat.first_name, chat.last_name])) or fname
+                if new_username != uname or new_full_name != fname:
+                    save_user(message.chat.id, uid, new_username, new_full_name)
+                refreshed.append((uid, new_username, new_full_name))
+            except Exception as e:
+                logging.info(f"Не удалось обновить данные user_id={uid}: {e}")
+                refreshed.append((uid, uname, fname))
+        else:
+            refreshed.append((uid, uname, fname))
+    users = refreshed
 
     # Убираем автора команды из списка, если хотите не упоминать самого себя — раскомментируйте:
     # users = [u for u in users if u[0] != message.from_user.id]
